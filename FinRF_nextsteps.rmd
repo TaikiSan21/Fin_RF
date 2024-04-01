@@ -1,0 +1,184 @@
+FP/TP/Dropped hours based on 6 minute review rules
+Sum across t/n for all hours
+
+
+HOUR:
+
+3, .8; 2, .7; 4, .6; 1, .9
+
+nSixDropped (TP & FP)
+nSixReviewed (TP & FP)
+nSixAccepted (TP & FP) (no review)
+hourStatus - Accepted, Dropped, Reviewd
+hourResult - FP, TP, FN
+
+May need to add # of positive six minutes. Idea is maybe that there are hours where we have
+dropped everything except for 1 or 2 that are false positives, and hopefully if its TP
+we would have more? I Think? First pass doesnt seem to support this, but cant figure out
+if I'm doing it the right way for a given set of nMin/revThresh
+
+```{r}
+nThreshSummary <- function(x, nMin=1:5, tComp=c(.7, .75, .8, .85, .9), evCol='eventId') {
+    hasTruth <- 'evResult' %in% colnames(x)
+    nSix <- nrow(x)
+    nEvents <- length(unique(x[[evCol]]))
+    eventSummary <- bind_rows(lapply(split(x, x[[evCol]]), function(e) {
+        bind_rows(lapply(nMin, function(n) {
+            dropIx <- e$nPreds < n
+            thisSum <- e[!dropIx, ]
+            result <- bind_rows(lapply(tComp, function(t) {
+                revIx <- thisSum$meanPos <= t
+                result <- list(nMin=n,
+                               revThresh=t)
+                if(hasTruth) {
+                    result$tpReviewed <- sum(thisSum$evResult[revIx] == 'TP')
+                    result$fpReviewed <- sum(thisSum$evResult[revIx] == 'FP')
+                    result$tpAccepted <- sum(thisSum$evResult[!revIx] == 'TP')
+                    result$fpAccepted <- sum(thisSum$evResult[!revIx] == 'FP')
+                }
+                result$reviewStatus <- 'Dropped'
+                nAccepted <- sum(!revIx)
+                nReviewed <- sum(revIx)
+                result$sixAccepted <- nAccepted
+                result$sixReviewed <- nReviewed
+                if(nAccepted > 0) {
+                    result$reviewStatus <- 'Accepted'
+                } else if(nReviewed > 0) {
+                    result$reviewStatus <- 'Review'
+                }
+                result
+            }))
+            if(hasTruth) {
+                hourTrue <- any(e$finEvent)
+                hourPred <- any(e$predEvent)
+                tpDropped <- sum(e$evResult[dropIx] =='TP')
+                fpDropped <- sum(e$evResult[dropIx] == 'FP')
+                result$hourResult <- typeLab(hourTrue, hourPred)
+                result$tpDropped <- tpDropped
+                result$fpDropped <- fpDropped
+            }
+            result
+        }))
+    }), .id=evCol)
+    threshSummary <- group_by(eventSummary, nMin, revThresh)
+    if(hasTruth) {
+        threshSummary <- summarise(threshSummary, 
+                                   nDropped = sum(reviewStatus == 'Dropped'),
+                                   nAccepted = sum(reviewStatus == 'Accepted'),
+                                   nReviewed = sum(reviewStatus == 'Review'),
+                                   tpSixReviewed=sum(tpReviewed * (reviewStatus == 'Review')),
+                                   fpSixReviewed=sum(fpReviewed * (reviewStatus == 'Review')),
+                                   sixReviewed = sum(sixReviewed * (reviewStatus == 'Review')),
+                                   
+                                   # tpSixAccepted=sum(tpAccepted),
+                                   # fpSixAccepted=sum(fpAccepted),
+                                   # tpSixDropped=sum(tpDropped),
+                                   # fpSixDropped=sum(fpDropped),
+                                   tpDropped = sum(reviewStatus == 'Dropped' & hourResult == 'TP'),
+                                   tpAccepted = sum(reviewStatus == 'Accepted' & hourResult == 'TP'),
+                                   tpReviewed = sum(reviewStatus == 'Review' & hourResult == 'TP'),
+                                   fpDropped = sum(reviewStatus == 'Dropped' & hourResult == 'FP'),
+                                   fpAccepted = sum(reviewStatus == 'Accepted' & hourResult == 'FP'),
+                                   fpReviewed = sum(reviewStatus == 'Review' & hourResult == 'FP')
+        )
+    } else {
+        threshSummary <- summarise(threshSummary,
+                                   nDropped = sum(reviewStatus == 'Dropped'),
+                                   nAccepted = sum(reviewStatus == 'Accepted'),
+                                   nReviewed = sum(reviewStatus == 'Review'),
+                                   sixReviewed = sum(sixReviewed * (reviewStatus == 'Review'))
+        )
+    }
+    threshSummary$sixReviewed <- threshSummary$sixReviewed / nSix
+    out <- list(eventSummary=eventSummary, threshSummary=threshSummary, nEvents=nEvents, nSix=nSix)
+    if(hasTruth) {
+        finSix <- sum(x$finEvent)
+        finEvents <- group_by(x, .data[[evCol]]) %>% 
+            summarise(hourEvent=any(finEvent))
+        finEvents <- sum(finEvents$hourEvent)
+        out$finEvents <- finEvents
+        out$finSix <- finSix
+    }
+    out
+}
+hm <- nThreshSummary(filter(sixGroup, drift %in% len22))
+```
+
+```{r}
+plotNThreshSummary <- function(x, nMin=1:5, tComp=c(.7, .75, .8, .85, .9), evCol='eventId') {
+    if(is.data.frame(x)) {
+        x <- nThreshSummary(x, nMin=nMin, tComp=tComp, evCol=evCol)
+    }
+    threshData <- x$threshSummary %>% 
+        mutate(accText = paste0(tpAccepted, ' / ', fpAccepted, ' / ',
+                                round((fpAccepted/x$finEvents), 2)),
+               revText = paste0(tpSixReviewed, ' / ', fpSixReviewed, ' / ',
+                                round(sixReviewed, 2)),
+               dropText = paste0(tpDropped, ' / ', fpDropped))
+    title <- paste0()
+    acceptPlot <- ggplot() +
+        geom_tile(data=threshData, aes(x=nMin, y=revThresh, fill=nAccepted)) +
+        geom_text(data=threshData, aes(x=nMin, y=revThresh, label=accText)) +
+        scale_fill_gradientn(colors=rev(scales::viridis_pal()(25))) +
+        ggtitle(paste0('TP/FP Accepted (',x$finEvents, ' Fin & ', x$nEvents, ' Total Events)'))
+    
+    revPlot <- ggplot(threshData) +
+        geom_tile(aes(x=nMin, y=revThresh, fill=nReviewed)) +
+        geom_text(aes(x=nMin, y=revThresh, label=revText)) +
+        scale_fill_gradientn(colors=rev(scales::viridis_pal()(25))) +
+        ggtitle(paste0('TP/FP Reviewed (',x$finSix, ' Fin & ', x$nSix, ' Total Six)'))
+    
+    dropPlot <- ggplot(threshData, aes(x=nMin, y=revThresh)) +
+        geom_tile(aes(fill=nDropped)) +
+        geom_text(aes(label=dropText)) +
+        scale_fill_gradientn(colors=rev(scales::viridis_pal()(25)))
+    list(acceptPlot=acceptPlot, revPlot=revPlot, dropPlot=dropPlot)
+}
+plotNThreshSummary(hm)
+```
+
+Something about number of 6min files to review in an event series
+
+```{r}
+hm$eventSummary %>% 
+    filter(nMin == 2 & revThresh == .85,
+           reviewStatus == 'Reviewed') %>% 
+    ggplot(aes(x=sixReviewed, fill=hourResult)) +
+    geom_histogram()
+```
+
+sixGroup <- summarisePredEvent(newPdf, evCol=c('drift', 'eventId', 'sixMin'), thresh=.5)
+
+```{r}
+sixRevs <- markReviewStatus(allPdf, nMin=3, revThresh = .85, evCol=c('drift', 'hour', 'sixMin'))
+table(sixRevs$reviewStatus)
+```
+```{r}
+allPdf$hour <- floor_date(allPdf$UTC, unit = '1hour')
+allPdf$sixMin <- floor_date(allPdf$UTC, unit='6mins')
+allReview <- markReviewStatus(allPdf, nMin=3, revThresh = .85, evCol=c('drift', 'hour', 'sixMin'))
+table(allReview$reviewStatus)
+allReview <- allReview %>% 
+    group_by(drift, hour) %>% 
+    mutate(nReview = sum(reviewStatus == 'Review'),
+           nAccept = sum(reviewStatus == 'Accepted'),
+           hourStatus = ifelse(nReview > 0, 'Review', 'Dropped'),
+           hourStatus = ifelse(nAccept > 0, 'Accepted', hourStatus)) %>% 
+    ungroup()
+```
+
+```{r}
+
+
+filter(allReview, drift == 'ADRIFT_028') %>% 
+    split(day(.$hour)) %>%
+    lapply(plotReviewStatus)
+```
+
+Notes for review process:
+Create a folder of images for each drifts review events, and create a CSV in there
+that is pre-filled with the review data. Then have an ingest function to read in that
+CSV to mark events appropriately
+
+IDEA for each drift make a grid of each row is an hour, column is 6 minute. Color
+by outline is review status, fill is n preds or mean pos or something like that

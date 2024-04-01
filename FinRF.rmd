@@ -1,0 +1,568 @@
+---
+title: Fin Whale Random Forest Model - ADRIFT
+author: Taiki Sakai
+format: html
+date: 10-3-2023
+---
+
+Developing a fin whale pulse classifier using ADRIFT data.
+
+```{r}
+library(PAMpal)
+library(here)
+library(dplyr)
+# logical flag to do early data prep steps
+prepData <- FALSE
+```
+
+### Data Preparation
+Load data previously processed with PAMpal and additional `finClick` function from finClick.R
+
+```{r}
+data <- readRDS('Data/All_ADRIFT_Fin_Preval.rds')
+data <- calculateICI(data, time='peakTime')
+data
+```
+
+Need to mark which clicks have been validated as fin whales.
+
+
+```{r, eval=prepData}
+clickData <- getClickData(data)
+ici <- getICI(data, 'data')
+clickData <- markValidClick(clickData, here('Data/Validated/'), ici=ici)
+
+table(clickData$isFin)
+table(basename(clickData$db), clickData$isFin)
+```
+Adding in newly validated ADRIFT_047 data from Cory
+
+```{r, eval=prepData}
+newData <- readRDS('Data/ADRIFT_47_Fin_Preval.rds')
+newData <- calculateICI(newData, 'peakTime')
+ici <- getICI(newData, 'data')
+newClicks <- getClickData(newData)
+newClicks <- markValidClick(newClicks, here('Data/Validated'), ici)
+table(newClicks$isFin)
+```
+
+```{r, eval=prepData}
+clickData <- bind_rows(clickData, newClicks)
+clickData$drift <- gsub('(ADRIFT_[0-9]{3})_.*', '\\1', basename(clickData$db))
+table(clickData$drift, clickData$isFin)
+saveRDS(clickData, here('Data/ADRIFT_FinModelDF_ALL47_ici.rds'))
+```
+
+```{r, eval=!prepData}
+clickData <- readRDS('Data/ADRIFT_FinModelDF_ALL47_ici.rds')
+```
+
+### Model Training
+
+For now we'll use the newest ADRIFT_047 (1k fins) for our test set, and all others (1.4k fins) as training.
+
+```{r}
+library(randomForest)
+library(rfPermute)
+# columns in data we dont want to use for model
+nonModelCols <- c('UID', 'UTC', 'Channel', 'angle',
+                  'angleError', 'BinaryFile', 'eventLabel',
+                  'eventId', 'db', 'species', 'predicted', 'peakTime', 'drift',
+                  'Click_Detector_0_ici', 'Click_Detector_1_ici')
+test <- PAMpal:::dropCols(clickData[clickData$drift == 'ADRIFT_047', ],
+                          cols=nonModelCols)
+train <- PAMpal:::dropCols(clickData[clickData$drift != 'ADRIFT_047', ],
+                           cols=nonModelCols)
+test$isFin <- factor(test$isFin, levels=c(TRUE, FALSE))
+train$isFin <- factor(train$isFin, levels=c(TRUE, FALSE))
+table(train$isFin)
+table(test$isFin)
+```
+
+We have severe imbalance between positive and negative classes. Naive model likely performs poorly.
+
+We can try randomly subsamplign before training to a balanced train set.
+
+```{r}
+nTree <- 5e3
+mtry <- 7
+subTrain <- slice_sample(train, n=sum(train$isFin == TRUE), by=isFin)
+subModel <- randomForest(isFin ~ ., data=subTrain, ntree=nTree, mtry=mtry)
+summary(subModel)
+```
+
+```{r}
+whichFin <- which(colnames(subTrain) == 'isFin')
+mtrTune <- tuneRF(x=subTrain[-whichFin], y=subTrain[[whichFin]], stepFactor = 1.5, improve=1e-6, ntree=nTree)
+mtrTune
+```
+
+```{r}
+# bigTry <- tuneRF(x=train[-whichFin], y=train[[whichFin]], stepFactor = 1.5, improve=1e-6, ntree=5000,
+#                  strata=train$isFin, sampsize=rep(sum(train$isFin == TRUE), 2))
+bigTry <- fitOneRF(clickData, test=testSet, ntree=8e3, mtryTune=TRUE, style='strat', mtry=7)
+bigTry
+```
+
+Or try using the strata and samp size arguments
+
+```{r}
+nTree <- 5e3
+mtry <- 7
+# noStrat <- randomForest(isFin ~., data=train, ntree=nTree, mtry=mtry)
+strat <- randomForest(isFin ~., data=train, strata = train$isFin, 
+                      sampsize=rep(sum(train$isFin == TRUE), 2), 
+                      ntree=nTree, mtry=mtry)
+strat <- fit
+# summary(noStrat)
+summary(strat)
+```
+
+Threshold comparison suggests that increasing from .5 to .6 thresh
+can cut in half num false positive events while barely increasing
+false negative events.
+
+```{r}
+threshCheck <- compareThresh(makePredDf(stratIci, test))
+ggplot(threshCheck, aes(x=threshold)) +
+    geom_line(aes(y=missedEvent), col='red') +
+    geom_line(aes(y=falseEvent), col='blue')
+```
+
+```{r}
+library(ggplot2)
+
+
+comps <- plotComps(list(strat
+                        , noStrat, subModel), c('Strat', 'NoStrat', 'Sub'), test)
+library(patchwork)
+comps$prPlot
+comps$cmPlot
+comps$rocPlot
+```
+
+Checking against various splits
+
+```{r}
+table(clickData$drift, clickData$isFin)
+heldOut <- list('27'=c('ADRIFT_027'), '47'=c('ADRIFT_047'), '49'=c('ADRIFT_049'), '53'=c('ADRIFT_053'),
+                'Else'=paste0('ADRIFT_0', c(28,50,51,52,54)))
+```
+
+```{r}
+allStratIci <- fitRFLoop(clickData, heldOut, style='strat', ntree=1500, mtry=7)   
+allStrat <- fitRFLoop(clickData, heldOut, style='strat', ntree=1500, mtry=7, drop=c('ici', 'All_ici'))
+```
+
+```{r}
+allSubIci <- fitRFLoop(clickData, heldOut, style='sub', ntree=1500, mtry=7)
+allSub <- fitRFLoop(clickData, heldOut, style='sub', ntree=1500, mtry=7, drop=c('ici', 'All_ici'))
+```
+
+```{r}
+stPlots <- plotComps(allStrat, names(allStrat))
+subPlots <-plotComps(allSub, names(allSub))
+```
+
+```{r}
+stratIci <- fitOneRF(clickData, test='ADRIFT_047', ntree=5e3, mtry=7, style='strat')
+strat <- fitOneRF(clickData, test='ADRIFT_047', ntree=5e3, mtry=7, style='strat', drop=c('All_ici', 'ici'))
+
+```
+
+```{r}
+test <- clickData[clickData$drift %in% 'ADRIFT_047', ]
+test$isFin <- factor(test$isFin, levels=c(TRUE, FALSE))
+iciComps <- plotComps(list(stratIci, strat), names=c('StratIci', 'Strat'), test=test)
+```
+```{r}
+iciCompsAll <- plotComps(list(stratIci, strat), names=c('StratIci', 'Strat'), test=clickData)
+```
+
+
+```{r}
+iciPreds <- makePredDf(stratIci, clickData)
+```
+
+
+
+## Lets fake a BANTER
+
+```{r}
+evLabels <- group_by(clickData, eventId) %>% 
+    summarise(species = ifelse(any(isFin), 'Fin', 'NotFin'))
+colnames(evLabels)[1] <- c('event')
+str(evLabels)
+dataSpec <- setSpecies(data, method='manual', value=evLabels)
+```
+
+```{r}
+library(banter)
+bntData <- export_banter(dataSpec)
+# bntData$detectors <-
+#     list('Click_Detector_0' = bntData$detectors$Click_Detector_0,
+#          'Click_Detector_1Loud' = filter(bntData$detectors$Click_Detector_1, dBPP >-20),
+#          'Click_Detector_1Quiet' = filter(bntData$detectors$Click_Detector_1, dBPP <= -20))
+bntModel <- initBanterModel(bntData$events)
+bntModel <- addBanterDetector(bntModel, bntData$detectors, ntree=2e3, sampsize=100)
+bntModel <- runBanterModel(bntModel, ntree=2e3, sampsize=20)
+summary(bntModel)
+```
+
+## Preliminary Results
+
+Fit model with detection-level ICI and stratified sampling
+
+
+
+Plotting the predicted probability (scaled num votes) vs the actual class
+for our dataset
+
+```{r}
+ggplot(pdf, aes(x=pTrue, fill=isFin)) +
+    geom_histogram() +
+    xlim(.49, 1) +
+    ggtitle('Detection Score vs Class')
+```
+
+Average mean prob for positive predictions by class
+
+```{r}
+ggplot(hourEv, aes(x=meanPos, fill=finEvent)) +
+    geom_histogram() +
+    ggtitle('Average Positive Score vs Class')
+```
+
+Investigation - number of positive predictions for event
+
+```{r}
+ggplot(hourEv, aes(x=nPreds, y=meanPos, col=finEvent)) +
+    geom_point(size=2) +
+    xlim(-.1, max(hourEv$nPreds[!hourEv$finEvent])+1) +
+    ggtitle('Num Positive vs Average Score by Class')
+```
+
+Check effect of changing prediction threshold
+
+```{r}
+# tCheck <- compareThresh(pdf, int=.01, evCol='hour')
+plotThreshComp(tCheck, min=.48)
+```
+
+Next steps:
+- noise levels for our detections
+- Think about adding another testing dataset - AD47 is within same deployment as training
+- ICI of positive predictions 
+- Check SNR distribution across all drifts, including CCES data
+
+Potential cutoffs:
+N > 5
+P > .75?
+
+For Cory
+- estimate num events out of total possible
+- ICI for predictions
+- For validation, wigners + timeline
+
+
+## ICI for Predictions
+
+```{r}
+pdfIci <- positiveICI(pdf, thresh=.5, evCol='hour')
+```
+
+```{r}
+(ggplot(pdfIci, aes(x=predICI, col=detResult)) +
+     geom_density() +
+     xlim(1, 120)) /
+    (ggplot(pdfIci, aes(x=ici, col=detResult)) +
+         geom_density() +
+         xlim(1, 120))
+```
+```{r}
+pdfIci %>% 
+    filter(evResult != 'TN',
+           nPred > 5) %>% 
+    ggplot() +
+    geom_boxplot(aes(x=evResult, y=predICI, col=evResult)) +
+    ylim(1, 120)
+```
+
+### New Data Split
+
+```{r}
+ggplot(clickData) +
+    geom_histogram(aes(x=UTC, color=isFin, fill=drift), linewidth=1) +
+    facet_wrap(~year(UTC), scales='free', ncol=1)
+```
+```{r}
+table(clickData$drift, year(clickData$UTC))
+table(clickData$drift, clickData$isFin)
+```
+
+Fins are present only in two groups of deployments - 27 to 31 and 47-54. Actually
+ADRIFT 54 is a northern deployment
+
+```{r}
+gps <- readRDS('../Data/Plotoff/ADRIFT_GPS.rds')
+```
+
+```{r}
+gps <- gps[gps$DriftName %in% unique(clickData$drift), ]
+gps %>% 
+    group_by(DriftName) %>% 
+    summarise(Lat=min(Latitude),
+              Lon=min(Longitude),
+              Start=min(UTC))
+```
+
+In 2021 AD2 & 3 are separate deployments
+In 2022 AD17, 27-28, 30-31 are separate deployments
+In 2023 AD47-53, AD54, and 79-80 are separate deployments
+
+In 2022 all fin clicks are in 27-28 deployment (338 total)
+In 2023 44 fin clicks are in 54, all others are in 47-53 deployment (2097)
+
+Plan for split - test set will include one of AD2/3, all of 27-28, maybe 54?
+
+```{r}
+testSet <- c('ADRIFT_003', 'ADRIFT_027', 'ADRIFT_028')
+ntree <- 10e3
+newModel <- fitOneRF(clickData, test=testSet, mtry=5, ntree=ntree, style='strat', drop=c('ici_next', 'rand'),seed=112188)
+newModel2Ici <- fitOneRF(clickData, test=testSet, mtry=5, ntree=ntree, style='strat', drop=c('rand'),
+                         seed=882111)
+newModel50pct <- fitOneRF(clickData, test=testSet, mtry=5, ntree=ntree, style='strat', 
+                          drop=c('ici_next', 'rand'), sampProp=.5, seed=121212)
+newModel75pct <- fitOneRF(clickData, test=testSet, mtry=5, ntree=ntree, style='strat', 
+                          drop=c('ici_next', 'rand'), sampProp=.75, seed=131313)
+```
+
+```{r}
+summary(newModel)
+summary(newModel2Ici)
+summary(newModel50pct)
+summary(newModel75pct)
+```
+
+```{r}
+clickData$rand <- runif(nrow(clickData))
+newModelRand <- fitOneRF(clickData, test=testSet, mtry=7, ntree=8e3, style='strat',
+                         seed=1357911)
+```
+
+```{r}
+summary(newModelRand)
+```
+
+
+```{r}
+newPdf <- bind_rows(
+    makePredDf(newModel, test=clickData[!clickData$drift %in% testSet, ], oob=TRUE),
+    makePredDf(newModel, test=clickData[clickData$drift %in% testSet, ])
+)
+newPdf$test <- newPdf$drift %in% testSet
+newPdf$hour <- paste0(newPdf$drift, '_', floor_date(newPdf$UTC, unit='1hour'))
+newPdf <- newPdf %>% 
+    group_by(eventId) %>% 
+    mutate(sixMin=as.numeric(difftime(UTC, min(UTC), units='mins')) / 6,
+           sixMin=floor(sixMin),
+           sixMin=paste0(eventId, '_', sixMin)) %>% 
+    ungroup()
+newPdf <- positiveICI(newPdf, evCol='sixMin', thresh=.5)
+```
+
+### Checking Results n test data
+
+Compare results on test set by drift
+
+```{r}
+table(newPdf$truth[isTest], newPdf$estimate[isTest])
+table(newPdf$detResult[isTest], newPdf$drift[isTest])
+```
+
+Okay its got pretty bad P/R on our test set. Need to investigate why things might
+be different. All of the ones we are missing have weirdly high peaks not
+really seen in our training data (and thus same for the various BW vars).
+
+```{r}
+ggplot(newPdf, aes(x=peak, col=detResult)) +
+    geom_density() +
+    facet_wrap(~test, ncol=1) +
+    xlim(0, .05)
+table(clickData$drift[clickData$isFin], clickData$peak[clickData$isFin] > .025)
+```
+```{r}
+newPdf %>% 
+    filter(drift=='ADRIFT_027') %>% 
+    ggplot(aes(x=pTrue, col=detResult)) +
+    geom_density(alpha=.5) +
+    facet_wrap(~peak>.025)
+```
+
+
+```{r}
+ad27 <- filter(newPdf, drift == 'ADRIFT_027', truth == TRUE)
+bins <- getBinaryData(data[unique(ad27$eventId)], UID=ad27$UID)
+```
+
+```{r}
+ix <- '1303000015' # highest TP pTrue
+ix <- '1550000024' # high pTrue FN
+ix <- '1420000013' # low pTrue FN
+ix <- '1365000059' # highest peak FN
+wig <- wignerTransform(PAMpal:::clipAroundPeak(bins[[ix]]$wave[, 1], length=200),
+                       sr=200, plot=T)
+lines(x=c(0,1), y=c(.2, .2))
+lines(x=c(0,1), y=c(.4, .4))
+lines(x=c(0,1), y=c(.3, .3))
+par(mfrow=c(2,2))
+ixVec  <- c( '1303000015','1550000024','1420000013','1365000059')
+labelVec <- c('High Prob True Positive',
+              'Higher Prob False Negative',
+              'Low Prob False Negative',
+              'High Peak False Negative')
+for(i in 1:4) {
+    wig <- wignerTransform(PAMpal:::clipAroundPeak(bins[[ixVec[i]]]$wave[, 1], length=200),
+                           sr=200, plot=T)
+    lines(x=c(0,1), y=c(.2, .2))
+    lines(x=c(0,1), y=c(.4, .4))
+    lines(x=c(0,1), y=c(.3, .3))
+    text(x=.1, y=.9, labelVec[i])
+}
+```
+
+```{r}
+isTest <- newPdf$drift %in% testSet
+trainThresh <- compareThresh(newPdf[!isTest, ], evCol='hour')
+testThresh <- compareThresh(newPdf[isTest, ], evCol='hour')
+```
+
+```{r}
+plotThreshComp(trainThresh) /
+    plotThreshComp(testThresh)
+```
+
+Previous hour events were flawed because we only have 12/60 or sometimes 22/60.
+Redo with 6 minute events
+
+```{r}
+newPdf <- newPdf %>% 
+    group_by(eventId) %>% 
+    mutate(sixMin=as.numeric(difftime(UTC, min(UTC), units='mins')) / 6,
+           sixMin=round(sixMin, 0),
+           sixMin=paste0(eventId, '_', sixMin)) %>% 
+    ungroup()
+trainThreshSix <- compareThresh(newPdf[!isTest, ], evCol='sixMin')
+testThreshSix <- compareThresh(newPdf[isTest, ], evCol='sixMin')
+```
+
+```{r}
+plotThreshComp(trainThreshSix) /
+    plotThreshComp(testThreshSix)
+```
+
+```{r}
+plotThreshComp(trainThresh) /
+    plotThreshComp(testThresh)
+```
+
+
+Model summary for training data
+
+```{r}
+trainSummary <- plotModelSummary(newPdf[!isTest, ], evCol='hour', thresh=.5, title='Training Data .5',
+                                 file='TrainSummaryPt5.png')
+suppressWarnings(print(trainSummary))
+```
+
+Model sumamry for test set data
+
+```{r}
+testSummary <- plotModelSummary(newPdf[isTest, ], evCol = 'hour', thresh=.5, title='Test Data .5',
+                                file='TestSummaryPt5.png')
+suppressWarnings(print(testSummary))
+```
+
+```{r}
+trainSummary <- plotModelSummary(newPdf[!isTest, ], evCol='hour', thresh=.6, title='Training Data .6',
+                                 file='TrainSummaryPt6.png')
+suppressWarnings(print(trainSummary))
+```
+
+```{r}
+testSummary <- plotModelSummary(newPdf[isTest, ], evCol = 'hour', thresh=.6, title='Test Data .6',
+                                file='TestSummaryPt6.png')
+suppressWarnings(print(testSummary))
+```
+
+```{r}
+testSumm5 <- plotModelSummary(newPdf[isTest, ], evCol = 'sixMin', thresh=.5, title='Six Min Test Data .5',
+                              file='TestSummaryPt5.png')
+testSumm6 <- plotModelSummary(newPdf[isTest, ], evCol = 'sixMin', thresh=.6, title='Six Min Test Data .6',
+                              file='TestSummaryPt6.png')
+testSumm7 <- plotModelSummary(newPdf[isTest, ], evCol='sixMin', thresh=.7, title='Six Min Test Data .7',
+                              file='TestSummaryPt7.png')
+trainSumm5 <- plotModelSummary(newPdf[!isTest, ], evCol = 'sixMin', thresh=.5, title='Six Min Train Data .5 OOB',
+                               file='TrainSummaryPt5OOB.png')
+trainSumm6 <- plotModelSummary(newPdf[!isTest, ], evCol = 'sixMin', thresh=.6, title='Six Min Train Data .6 OOB',
+                               file='TrainSummaryPt6OOB.png')
+trainSumm7 <- plotModelSummary(newPdf[!isTest, ], evCol='sixMin', thresh=.7, title='Six Min Train Data .7 OOB',
+                               file='TrainSummryPt7OOB.png')
+```
+
+### TOL Data
+
+Investigate possible relationship to background noise level and our
+predictions, first load TOL data.
+
+```{r}
+library(PAMscapes)
+tolDir <- 'Data/FinTOL/'
+tolFiles <- list.files(tolDir, full.names=TRUE)[-2]
+tolData <- bind_rows(lapply(tolFiles, function(x) {
+    # cat('\nLoading', x)
+    data <- checkSoundscapeInput(x)
+    data <- PAMscapes:::toLong(data)
+    data <- filter(data, frequency > 100)
+    data <- PAMscapes:::toWide(data)
+    drift <- gsub('^([A-z]*_[0-9]{1,3})_.*', '\\1', basename(x))
+    survey <- strsplit(drift, '_')[[1]][1]
+    data$drift <- drift
+    data
+}))
+```
+
+This has 125, 160, and 200 that might be relevant for our fins, so join those to our 
+prediction data. We are missing TOL for drifts 002, 017, and 079.
+
+```{r}
+tolPdf <- bind_rows(
+    lapply(split(newPdf, newPdf$drift), function(x) {
+        thisTOL <- tolData[tolData$drift == x$drift[1], ]
+        if(nrow(thisTOL) == 0) {
+            warning('No TOL for drift ', x$drift[1])
+            return(x)
+        }
+        x <- PAMpal::timeJoin(x, thisTOL[c('UTC', 'TOL_125', 'TOL_160', 'TOL_200')], thresh=3600)
+        x
+    }))
+```
+```{r}
+t125 <- ggplot() +
+    geom_density(data=tolPdf, aes(x=TOL_125, col=detResult)) +
+    ggtitle('TOL_125') +
+    geom_density(data=tolData, aes(x=TOL_125), col='black') +
+    xlim(70, 100)
+t160 <- ggplot() +
+    geom_density(data=tolPdf, aes(x=TOL_160, col=detResult)) +
+    ggtitle('TOL_160') +
+    geom_density(data=tolData, aes(x=TOL_160), col='black') +
+    xlim(70, 100)
+t200 <- ggplot() +
+    geom_density(data=tolPdf, aes(x=TOL_200, col=detResult)) +
+    ggtitle('TOL_200') +
+    geom_density(data=tolData, aes(x=TOL_200), col='black') +
+    xlim(70, 100)
+t125 / t160 / t200
+```
+
